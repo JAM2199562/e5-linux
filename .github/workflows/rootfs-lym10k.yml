@@ -1,0 +1,118 @@
+name: OpenWrt rootfs for LYM-10K
+
+# Builds only the OpenWrt rootfs ext4 image (E5_STANDALONE), not the whole
+# flash bundle.  make-flash-bundle.sh hardcodes profile=e5 and rewrites the
+# kernel with upstream/build.sh (devices/e5 only), so release.yml cannot
+# produce a LYM-10K package.  A rootfs, by contrast, is device-independent:
+# per-device files land at runtime from e5linux/device-files.tar.
+#
+# Outputs out/openwrt/e5-openwrt-<ver>-generic.ext4.gz
+
+on:
+  workflow_dispatch:
+    inputs:
+      openwrt_version:
+        description: OpenWrt release to build against
+        default: '25.12.5'
+
+permissions:
+  contents: read
+
+jobs:
+  rootfs:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    env:
+      E5_WRT_VER: ${{ inputs.openwrt_version || '25.12.5' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Check bootstrap configuration
+        env:
+          INPUTS_URL: ${{ vars.E5_CI_INPUTS_URL }}
+          INPUTS_SHA256: ${{ vars.E5_CI_INPUTS_SHA256 }}
+        run: |
+          [[ "$INPUTS_URL" == https://* ]] || { echo '::error::Set E5_CI_INPUTS_URL to the HTTPS bootstrap archive URL.'; exit 1; }
+          [[ "$INPUTS_SHA256" =~ ^[a-fA-F0-9]{64}$ ]] || { echo '::error::Set E5_CI_INPUTS_SHA256 to its SHA-256.'; exit 1; }
+
+      - name: Install host tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            curl ca-certificates python3 lz4 e2fsprogs binutils bc bison flex \
+            libssl-dev libelf-dev dwarves gcc-aarch64-linux-gnu cpio \
+            qemu-user-static binfmt-support
+          # The checksum-pinned OpenWrt SDK is x86_64; the runner is ARM64.
+          sudo update-binfmts --enable qemu-x86_64
+          docker info >/dev/null
+
+      - name: Restore and verify bootstrap inputs
+        env:
+          INPUTS_URL: ${{ vars.E5_CI_INPUTS_URL }}
+          INPUTS_SHA256: ${{ vars.E5_CI_INPUTS_SHA256 }}
+        run: |
+          curl --fail --location --retry 5 --proto '=https' --proto-redir '=https' \
+            --output "$RUNNER_TEMP/ci-inputs.tar.gz" "$INPUTS_URL"
+          python3 tools/ci-inputs.py restore "$RUNNER_TEMP/ci-inputs.tar.gz" --sha256 "$INPUTS_SHA256"
+          ls -l dumps/boot_b.img dumps/misc-head.bin work/busybox/ext/usr/bin/busybox
+
+      - name: Install root kernel modules from the kernel artifact run
+        # The kernel build (profile-kernels.yml) already produced
+        # root-modules.tar with this kernel's audio and wwan modules.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p work/kernel
+          # Take the newest successful profile-kernels artifact named kernel-lym10k.
+          run_id=$(gh api "repos/${{ github.repository }}/actions/workflows/profile-kernels.yml/runs?per_page=20" \
+                    --jq '[.workflow_runs[] | select(.conclusion=="success")][0].id')
+          [ -n "$run_id" ] && [ "$run_id" != null ] || { echo '::error::no successful profile-kernels run'; exit 1; }
+          echo "using profile-kernels run $run_id"
+          gh run download "$run_id" --repo "${{ github.repository }}" -n kernel-lym10k -D work/kernel
+          ls -l work/kernel
+          test -s work/kernel/root-modules.tar || { echo '::error::artifact has no root-modules.tar'; exit 1; }
+          mkdir -p work/kernel/root-modules
+          tar -xf work/kernel/root-modules.tar -C work/kernel/root-modules
+          set -- work/kernel/root-modules/lib/modules/*
+          [ $# = 1 ] || { echo "::error::expected one module release, found $#"; exit 1; }
+          [ -d "$1/audio" ] || { echo '::error::no audio modules'; exit 1; }
+          [ -f "$1/modem/sipc_wwan.ko" ] || { echo '::error::no sipc_wwan.ko'; exit 1; }
+          echo "release: $(basename "$1")"
+
+      - name: Build patched BlueZ and ModemManager
+        run: |
+          mkdir -p out/openwrt
+          bash openwrt/build-modemmanager.sh
+          bash openwrt/build-bluez.sh
+          ls -l out/openwrt/*.apk
+
+      - name: Build the OpenWrt rootfs ext4 image
+        env:
+          E5_STANDALONE: '1'
+          E5_DEVICE_FILES: '0'
+          E5_ROOT_MODULES_ONLY: '1'
+          E5_ROOT_MODULES: ${{ github.workspace }}/work/kernel/root-modules.tar
+          E5_BUSYBOX: ${{ github.workspace }}/work/busybox/ext/usr/bin/busybox
+          E5_BUILD_EPOCH: ${{ github.event.repository.pushed_at }}
+        run: |
+          set -o pipefail
+          bash openwrt/build-rootfs.sh 2>&1 | tee out/openwrt/rootfs-build.log
+
+      - name: Report the image
+        run: |
+          ls -l out/openwrt/*.ext4.gz
+          sha256sum out/openwrt/*.ext4.gz | tee out/openwrt/SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-rootfs-lym10k
+          path: |
+            out/openwrt/*.ext4.gz
+            out/openwrt/SHA256SUMS
+            out/openwrt/rootfs-build.log
+          if-no-files-found: error
+          retention-days: 14
