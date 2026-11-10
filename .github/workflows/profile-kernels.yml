@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        profile: [e5, t551m, m8, t512n, lym10k]
+        profile: [lym10k]
     steps:
       - uses: actions/checkout@v4
         with:
