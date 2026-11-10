@@ -74,6 +74,17 @@ jobs:
           echo "using profile-kernels run $run_id"
           gh run download "$run_id" --repo "${{ github.repository }}" -n kernel-lym10k -D work/kernel
           ls -l work/kernel
+          # The artifact is uploaded as one tar.gz of the output directory
+          # (profile-kernels.yml does `tar -czf kernel-<profile>.tar.gz -C $output .`),
+          # so root-modules.tar / Image / config sit one level down.
+          if [ ! -f work/kernel/root-modules.tar ]; then
+            bundle=$(ls work/kernel/*.tar.gz 2>/dev/null | head -1)
+            [ -n "$bundle" ] || { echo '::error::artifact has neither root-modules.tar nor a tar.gz'; ls -la work/kernel; exit 1; }
+            echo "unpacking $bundle"
+            tar -xzf "$bundle" -C work/kernel
+            rm -f "$bundle"
+          fi
+          ls -l work/kernel
           test -s work/kernel/root-modules.tar || { echo '::error::artifact has no root-modules.tar'; exit 1; }
           mkdir -p work/kernel/root-modules
           tar -xf work/kernel/root-modules.tar -C work/kernel/root-modules
